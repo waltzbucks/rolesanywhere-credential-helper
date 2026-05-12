@@ -356,15 +356,16 @@ func Serve(port int, credentialsOptions CredentialsOpts) {
 	log.Printf("export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://%s:%d/", LocalHostAddress, endpoint.PortNum)
 
 	// Graceful shutdown on SIGTERM/SIGINT
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
 	go func() {
-		<-quit
+		<-ctx.Done()
 		log.Println("Shutting down server...")
 		ticker.Stop()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := endpoint.Server.Shutdown(ctx); err != nil {
+		if err := endpoint.Server.Shutdown(shutdownCtx); err != nil {
 			log.Println("Server forced to shutdown:", err)
 		}
 	}()
