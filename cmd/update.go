@@ -15,6 +15,7 @@ var (
 
 func init() {
 	initCredentialsSubCommand(updateCmd)
+	initMultiSetFlags(updateCmd)
 	updateCmd.PersistentFlags().StringVar(&profile, "profile", "default", "profile to update")
 	updateCmd.PersistentFlags().BoolVar(&once, "once", false, "to update the profile just once")
 }
@@ -32,6 +33,12 @@ var updateCmd = &cobra.Command{
 
 		helper.Debug = credentialsOptions.Debug
 
-		helper.Update(credentialsOptions, profile, once)
+		multiSet, err := resolveMultiSet()
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+
+		helper.UpdateWithFailover(credentialsOptions, profile, once, multiSet)
 	},
 }

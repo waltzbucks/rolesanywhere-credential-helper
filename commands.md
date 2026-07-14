@@ -106,6 +106,7 @@ remaining entries.
 * Type: String
 * Required: No
 * Mutually exclusive with `--role-arn`, `--trust-anchor-arn`, `--profile-arn`, `--region`, and `--endpoint`
+* Available in `credential-process` and `update` (each refresh in `update` performs the same failover)
 
 `--multi-set-file <path>`
 
@@ -207,7 +208,7 @@ aws_signing_helper serve [--port <number>] [--hop-limit <number>] [options]
 
 ### Options
 
-(All options from `credential-process` are also available)
+(All options from `credential-process` are also available, except `--multi-set` and `--multi-set-file`)
 
 `--port <number>`
 

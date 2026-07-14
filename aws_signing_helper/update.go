@@ -23,6 +23,13 @@ type TemporaryCredential struct {
 
 // Updates credentials in the credentials file for the specified profile
 func Update(credentialsOptions CredentialsOpts, profile string, once bool) {
+	UpdateWithFailover(credentialsOptions, profile, once, nil)
+}
+
+// Like Update, but when multiSet is non-nil each refresh tries the
+// multi-set's regional entries in order (default entry first), failing over
+// on retryable CreateSession errors.
+func UpdateWithFailover(credentialsOptions CredentialsOpts, profile string, once bool, multiSet *MultiSet) {
 	var refreshableCred = TemporaryCredential{}
 	var nextRefreshTime time.Time
 
@@ -34,7 +41,13 @@ func Update(credentialsOptions CredentialsOpts, profile string, once bool) {
 	defer signer.Close()
 
 	for {
-		credentialProcessOutput, err := GenerateCredentials(&credentialsOptions, signer, signatureAlgorithm)
+		var credentialProcessOutput CredentialProcessOutput
+		var err error
+		if multiSet != nil {
+			credentialProcessOutput, err = GenerateCredentialsWithFailover(&credentialsOptions, signer, signatureAlgorithm, multiSet)
+		} else {
+			credentialProcessOutput, err = GenerateCredentials(&credentialsOptions, signer, signatureAlgorithm)
+		}
 		if err != nil {
 			log.Fatal(err)
 		}
