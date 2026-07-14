@@ -15,227 +15,137 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultMultiSetFileName is the file name of the multi-set file within the
-// user's AWS config directory, used when --multi-set-file isn't specified.
 const DefaultMultiSetFileName = "iamra-multiset.yaml"
 
-var accountIdRegex = regexp.MustCompile(`^[0-9]{12}$`)
+var accountIdPattern = regexp.MustCompile(`^[0-9]{12}$`)
 
-// IamraSetEntry is a single region's trust anchor/profile pair within an
-// IamraMultiSet.
-type IamraSetEntry struct {
+// yamlString accepts both quoted and unquoted YAML scalars (e.g. a bare
+// 123456789012 account id, which YAML would otherwise decode as an integer)
+// and preserves the raw text, including leading zeros.
+type yamlString string
+
+func (s *yamlString) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("line %d: expected a scalar value", value.Line)
+	}
+	*s = yamlString(value.Value)
+	return nil
+}
+
+// MultiSetEntry is one regional trust anchor/profile pair within a MultiSet.
+type MultiSetEntry struct {
 	TrustAnchorId string `yaml:"trust-anchor-id"`
 	ProfileId     string `yaml:"profile-id"`
 	Region        string `yaml:"region"`
 	Default       bool   `yaml:"default"`
 }
 
-// IamraMultiSet is one named group of region-specific trust anchor/profile
-// sets, tried in order (default entry first) until one succeeds.
-type IamraMultiSet struct {
-	IamraName     string          `yaml:"iamra-name"`
-	AccountId     string          `yaml:"account-id"`
+// MultiSet is a named group of regional Roles Anywhere resources that all
+// map to the same role, used to fail over between regions on retryable
+// CreateSession errors (throttling, 5xx, network).
+type MultiSet struct {
+	Name          string          `yaml:"iamra-name"`
+	AccountId     yamlString      `yaml:"account-id"`
 	AssumeRoleArn string          `yaml:"assume_role-arn"`
-	IamraSet      []IamraSetEntry `yaml:"iamra-set"`
+	IamraSet      []MultiSetEntry `yaml:"iamra-set"`
+
+	partition string
 }
 
-// rawIamraSetEntry/rawIamraMultiSet decode with yaml.Node values so that
-// unrecognized keys can be rejected and an unquoted account-id (parsed by
-// YAML as an integer) can be accepted without silently truncating it.
-type rawIamraSetEntry struct {
-	TrustAnchorId yaml.Node `yaml:"trust-anchor-id"`
-	ProfileId     yaml.Node `yaml:"profile-id"`
-	Region        yaml.Node `yaml:"region"`
-	Default       yaml.Node `yaml:"default"`
-}
-
-func (e *rawIamraSetEntry) UnmarshalYAML(node *yaml.Node) error {
-	type plain rawIamraSetEntry
-	if err := node.Decode((*plain)(e)); err != nil {
-		return err
-	}
-	return rejectUnknownKeys(node, "trust-anchor-id", "profile-id", "region", "default")
-}
-
-type rawIamraMultiSet struct {
-	IamraName     yaml.Node          `yaml:"iamra-name"`
-	AccountId     yaml.Node          `yaml:"account-id"`
-	AssumeRoleArn yaml.Node          `yaml:"assume_role-arn"`
-	IamraSet      []rawIamraSetEntry `yaml:"iamra-set"`
-}
-
-func (m *rawIamraMultiSet) UnmarshalYAML(node *yaml.Node) error {
-	type plain rawIamraMultiSet
-	if err := node.Decode((*plain)(m)); err != nil {
-		return err
-	}
-	return rejectUnknownKeys(node, "iamra-name", "account-id", "assume_role-arn", "iamra-set")
-}
-
-// rejectUnknownKeys returns an error if the mapping node contains a key not
-// present in allowed. This catches typos in the multi-set file (e.g.
-// "trust-anchor-id" misspelled) that would otherwise be silently ignored.
-func rejectUnknownKeys(node *yaml.Node, allowed ...string) error {
-	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("expected a YAML mapping, got %v", node.Kind)
-	}
-	allowedSet := make(map[string]bool, len(allowed))
-	for _, k := range allowed {
-		allowedSet[k] = true
-	}
-	for i := 0; i < len(node.Content); i += 2 {
-		key := node.Content[i].Value
-		if !allowedSet[key] {
-			return fmt.Errorf("unknown key %q at line %d", key, node.Content[i].Line)
-		}
-	}
-	return nil
-}
-
-// scalarString decodes a YAML scalar node to its string form, whether it was
-// written quoted (already a string) or unquoted (e.g. an integer like
-// account-id: 123456789012).
-func scalarString(node yaml.Node) (string, bool) {
-	if node.Kind != yaml.ScalarNode || node.Tag == "!!null" {
-		return "", false
-	}
-	return node.Value, true
-}
-
-func scalarBool(node yaml.Node) (bool, error) {
-	if node.Kind != yaml.ScalarNode || node.Tag == "!!null" {
-		return false, nil
-	}
-	var b bool
-	if err := node.Decode(&b); err != nil {
-		return false, fmt.Errorf("invalid boolean at line %d: %w", node.Line, err)
-	}
-	return b, nil
-}
-
-// LoadMultiSet reads the multi-set YAML file at path and returns the entry
-// whose iamra-name matches name.
-func LoadMultiSet(path string, name string) (IamraMultiSet, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return IamraMultiSet{}, fmt.Errorf("unable to read multi-set file '%s': %w", path, err)
-	}
-
-	var rawSets []rawIamraMultiSet
-	if err := yaml.Unmarshal(data, &rawSets); err != nil {
-		return IamraMultiSet{}, fmt.Errorf("unable to parse multi-set file '%s': %w", path, err)
-	}
-
-	for _, rawSet := range rawSets {
-		iamraName, ok := scalarString(rawSet.IamraName)
-		if !ok || iamraName != name {
-			continue
-		}
-		return parseMultiSet(rawSet)
-	}
-
-	return IamraMultiSet{}, fmt.Errorf("no multi-set named '%s' found in '%s'", name, path)
-}
-
-func parseMultiSet(rawSet rawIamraMultiSet) (IamraMultiSet, error) {
-	iamraName, _ := scalarString(rawSet.IamraName)
-
-	accountId, ok := scalarString(rawSet.AccountId)
-	if !ok {
-		return IamraMultiSet{}, fmt.Errorf("multi-set '%s': missing account-id", iamraName)
-	}
-	if !accountIdRegex.MatchString(accountId) {
-		return IamraMultiSet{}, fmt.Errorf("multi-set '%s': account-id must be exactly 12 digits", iamraName)
-	}
-
-	assumeRoleArnStr, ok := scalarString(rawSet.AssumeRoleArn)
-	if !ok {
-		return IamraMultiSet{}, fmt.Errorf("multi-set '%s': missing assume_role-arn", iamraName)
-	}
-	if _, err := arn.Parse(assumeRoleArnStr); err != nil {
-		return IamraMultiSet{}, fmt.Errorf("multi-set '%s': invalid assume_role-arn: %w", iamraName, err)
-	}
-
-	if len(rawSet.IamraSet) == 0 {
-		return IamraMultiSet{}, fmt.Errorf("multi-set '%s': iamra-set must contain at least one entry", iamraName)
-	}
-
-	multiSet := IamraMultiSet{
-		IamraName:     iamraName,
-		AccountId:     accountId,
-		AssumeRoleArn: assumeRoleArnStr,
-	}
-
-	defaultSeen := false
-	for i, rawEntry := range rawSet.IamraSet {
-		trustAnchorId, ok := scalarString(rawEntry.TrustAnchorId)
-		if !ok {
-			return IamraMultiSet{}, fmt.Errorf("multi-set '%s': entry %d: missing trust-anchor-id", iamraName, i)
-		}
-		profileId, ok := scalarString(rawEntry.ProfileId)
-		if !ok {
-			return IamraMultiSet{}, fmt.Errorf("multi-set '%s': entry %d: missing profile-id", iamraName, i)
-		}
-		region, ok := scalarString(rawEntry.Region)
-		if !ok {
-			return IamraMultiSet{}, fmt.Errorf("multi-set '%s': entry %d: missing region", iamraName, i)
-		}
-		isDefault, err := scalarBool(rawEntry.Default)
-		if err != nil {
-			return IamraMultiSet{}, fmt.Errorf("multi-set '%s': entry %d: %w", iamraName, i, err)
-		}
-		if isDefault {
-			if defaultSeen {
-				return IamraMultiSet{}, fmt.Errorf("multi-set '%s': more than one entry marked default", iamraName)
-			}
-			defaultSeen = true
-		}
-
-		multiSet.IamraSet = append(multiSet.IamraSet, IamraSetEntry{
-			TrustAnchorId: trustAnchorId,
-			ProfileId:     profileId,
-			Region:        region,
-			Default:       isDefault,
-		})
-	}
-
-	return multiSet, nil
-}
-
-// DefaultMultiSetFilePath returns "~/.aws/iamra-multiset.yaml".
+// DefaultMultiSetFilePath returns ~/.aws/iamra-multiset.yaml, mirroring the
+// location of the AWS CLI configuration files.
 func DefaultMultiSetFilePath() (string, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("unable to determine home directory: %w", err)
+		return "", fmt.Errorf("unable to locate home directory for the default multi-set file: %w", err)
 	}
 	return filepath.Join(homeDir, ".aws", DefaultMultiSetFileName), nil
 }
 
-// orderedEntries returns the multi-set's entries with the default entry (if
-// any) moved to the front, otherwise in file order.
-func orderedEntries(multiSet IamraMultiSet) []IamraSetEntry {
-	entries := make([]IamraSetEntry, 0, len(multiSet.IamraSet))
-	var defaultEntry *IamraSetEntry
-	for i := range multiSet.IamraSet {
-		if multiSet.IamraSet[i].Default {
-			defaultEntry = &multiSet.IamraSet[i]
-			continue
+// LoadMultiSet reads the multi-set YAML file at path and returns the
+// validated entry whose iamra-name matches name.
+func LoadMultiSet(path string, name string) (*MultiSet, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read multi-set file: %w", err)
+	}
+	defer file.Close()
+
+	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
+	var multiSets []MultiSet
+	if err := decoder.Decode(&multiSets); err != nil {
+		return nil, fmt.Errorf("unable to parse multi-set file '%s': %w", path, err)
+	}
+
+	var names []string
+	for i := range multiSets {
+		if multiSets[i].Name == name {
+			multiSet := multiSets[i]
+			if err := multiSet.validate(); err != nil {
+				return nil, fmt.Errorf("invalid multi-set '%s' in '%s': %w", name, path, err)
+			}
+			return &multiSet, nil
 		}
-		entries = append(entries, multiSet.IamraSet[i])
+		names = append(names, multiSets[i].Name)
 	}
-	if defaultEntry != nil {
-		entries = append([]IamraSetEntry{*defaultEntry}, entries...)
-	}
-	return entries
+	return nil, fmt.Errorf("multi-set '%s' not found in '%s' (available: %v)", name, path, names)
 }
 
-// entryArns builds the trust anchor and profile ARNs for entry, using
-// accountId and the partition parsed from assumeRoleArn (trust anchor and
-// profile ARNs always share the caller's partition).
-func entryArns(entry IamraSetEntry, accountId string, assumeRoleArn arn.ARN) (trustAnchorArn string, profileArn string) {
-	trustAnchorArn = fmt.Sprintf("arn:%s:rolesanywhere:%s:%s:trust-anchor/%s", assumeRoleArn.Partition, entry.Region, accountId, entry.TrustAnchorId)
-	profileArn = fmt.Sprintf("arn:%s:rolesanywhere:%s:%s:profile/%s", assumeRoleArn.Partition, entry.Region, accountId, entry.ProfileId)
-	return trustAnchorArn, profileArn
+func (m *MultiSet) validate() error {
+	if !accountIdPattern.MatchString(string(m.AccountId)) {
+		return fmt.Errorf("account-id '%s' must be a 12-digit AWS account id", m.AccountId)
+	}
+	roleArn, err := arn.Parse(m.AssumeRoleArn)
+	if err != nil {
+		return fmt.Errorf("invalid assume_role-arn '%s': %w", m.AssumeRoleArn, err)
+	}
+	m.partition = roleArn.Partition
+	if len(m.IamraSet) == 0 {
+		return errors.New("iamra-set must contain at least one entry")
+	}
+	defaultCount := 0
+	for i, entry := range m.IamraSet {
+		if entry.TrustAnchorId == "" || entry.ProfileId == "" || entry.Region == "" {
+			return fmt.Errorf("iamra-set entry #%d must set trust-anchor-id, profile-id, and region", i+1)
+		}
+		if entry.Default {
+			defaultCount++
+		}
+	}
+	if defaultCount > 1 {
+		return errors.New("iamra-set must mark at most one entry as default")
+	}
+	return nil
+}
+
+// orderedEntries returns the entries in attempt order: the default entry (if
+// any) first, followed by the remaining entries in file order.
+func (m *MultiSet) orderedEntries() []MultiSetEntry {
+	ordered := make([]MultiSetEntry, 0, len(m.IamraSet))
+	for _, entry := range m.IamraSet {
+		if entry.Default {
+			ordered = append(ordered, entry)
+		}
+	}
+	for _, entry := range m.IamraSet {
+		if !entry.Default {
+			ordered = append(ordered, entry)
+		}
+	}
+	return ordered
+}
+
+// credentialsOptsFor clones the base options and fills in the ARNs and region
+// for one regional attempt. GenerateCredentials mutates its options, so each
+// attempt must get its own copy.
+func (m *MultiSet) credentialsOptsFor(entry MultiSetEntry, base *CredentialsOpts) CredentialsOpts {
+	opts := *base
+	opts.RoleArn = m.AssumeRoleArn
+	opts.TrustAnchorArnStr = fmt.Sprintf("arn:%s:rolesanywhere:%s:%s:trust-anchor/%s", m.partition, entry.Region, m.AccountId, entry.TrustAnchorId)
+	opts.ProfileArnStr = fmt.Sprintf("arn:%s:rolesanywhere:%s:%s:profile/%s", m.partition, entry.Region, m.AccountId, entry.ProfileId)
+	opts.Region = entry.Region
+	return opts
 }
 
 // retryableDNSError treats any DNS failure as retryable. The SDK's
@@ -255,54 +165,49 @@ func (retryableDNSError) IsErrorRetryable(err error) aws.Ternary {
 // createSessionRetryables mirrors the SDK's standard retryer classification
 // (retry.DefaultRetryables: connection-level failures, retryable/throttling
 // API error codes, and retryable HTTP status codes), plus retryableDNSError.
-// Everything else (AccessDenied, validation, resource-not-found, malformed
-// input, etc.) is a configuration error that failover would only reproduce
-// or mask, so it must not trigger failover.
+// Everything else (AccessDenied, validation, resource-not-found, ...) is a
+// configuration problem that the next region would only reproduce or mask,
+// so it must not trigger failover.
 var createSessionRetryables = retry.IsErrorRetryables(append(
 	[]retry.IsErrorRetryable{retryableDNSError{}},
 	retry.DefaultRetryables...,
 ))
 
-func isRetryableCreateSessionError(err error) bool {
+// IsRetryableCreateSessionError reports whether a CreateSession failure is
+// worth retrying against another region's trust anchor/profile pair.
+func IsRetryableCreateSessionError(err error) bool {
 	return createSessionRetryables.IsErrorRetryable(err) == aws.TrueTernary
 }
 
-// GenerateCredentialsWithFailover tries CreateSession against each entry in
-// multiSet in order (default entry first), moving on to the next entry only
-// when the error is classified as retryable. A non-retryable error (e.g.
-// AccessDeniedException from a misconfigured ARN) is returned immediately
-// without trying the remaining entries. The role ARN is taken from the
-// multi-set's assume_role-arn, not from opts.
-func GenerateCredentialsWithFailover(opts *CredentialsOpts, signer Signer, signatureAlgorithm string, multiSet IamraMultiSet) (CredentialProcessOutput, error) {
-	// Already validated by LoadMultiSet, so this parse cannot fail
-	assumeRoleArn, err := arn.Parse(multiSet.AssumeRoleArn)
-	if err != nil {
-		return CredentialProcessOutput{}, fmt.Errorf("failed to parse assume_role-arn: '%w'", err)
-	}
+type generateCredentialsFunc func(*CredentialsOpts, Signer, string) (CredentialProcessOutput, error)
 
-	entries := orderedEntries(multiSet)
+// GenerateCredentialsWithFailover tries CreateSession against each entry of
+// the multi-set in order (default entry first) and returns the first
+// successful result. Retryable errors move on to the next entry;
+// non-retryable errors abort immediately.
+func GenerateCredentialsWithFailover(opts *CredentialsOpts, signer Signer, signatureAlgorithm string, multiSet *MultiSet) (CredentialProcessOutput, error) {
+	return generateCredentialsWithFailover(opts, signer, signatureAlgorithm, multiSet, GenerateCredentials)
+}
+
+func generateCredentialsWithFailover(opts *CredentialsOpts, signer Signer, signatureAlgorithm string, multiSet *MultiSet, generate generateCredentialsFunc) (CredentialProcessOutput, error) {
+	entries := multiSet.orderedEntries()
 	var lastErr error
 	for i, entry := range entries {
-		trustAnchorArn, profileArn := entryArns(entry, multiSet.AccountId, assumeRoleArn)
-
-		attemptOpts := *opts
-		attemptOpts.RoleArn = multiSet.AssumeRoleArn
-		attemptOpts.TrustAnchorArnStr = trustAnchorArn
-		attemptOpts.ProfileArnStr = profileArn
-		attemptOpts.Region = ""
-		attemptOpts.Endpoint = ""
-
-		output, err := GenerateCredentials(&attemptOpts, signer, signatureAlgorithm)
+		attemptOpts := multiSet.credentialsOptsFor(entry, opts)
+		output, err := generate(&attemptOpts, signer, signatureAlgorithm)
 		if err == nil {
+			if i > 0 {
+				log.Printf("multi-set '%s': CreateSession succeeded in region %s after failover", multiSet.Name, entry.Region)
+			}
 			return output, nil
 		}
-
 		lastErr = err
-		if !isRetryableCreateSessionError(err) {
-			return CredentialProcessOutput{}, err
+		if !IsRetryableCreateSessionError(err) {
+			return CredentialProcessOutput{}, fmt.Errorf("multi-set '%s': CreateSession in region %s failed with non-retryable error: %w", multiSet.Name, entry.Region, err)
 		}
-		log.Printf("multi-set '%s': attempt %d/%d (region %s) failed with a retryable error, trying next entry: %v", multiSet.IamraName, i+1, len(entries), entry.Region, err)
+		if i < len(entries)-1 {
+			log.Printf("multi-set '%s': CreateSession in region %s failed with retryable error, trying next entry: %v", multiSet.Name, entry.Region, err)
+		}
 	}
-
-	return CredentialProcessOutput{}, fmt.Errorf("all %d entries in multi-set '%s' failed, last error: %w", len(entries), multiSet.IamraName, lastErr)
+	return CredentialProcessOutput{}, fmt.Errorf("multi-set '%s': all %d entries failed, last error: %w", multiSet.Name, len(entries), lastErr)
 }
