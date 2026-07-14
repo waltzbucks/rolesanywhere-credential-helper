@@ -93,6 +93,48 @@ Skip verification of the SSL certificate on the endpoint.
 * Type: Boolean
 * Required: No
 
+`--multi-set <name>`
+
+Name (`iamra-name`) of a multi-region failover set defined in the multi-set file. When set, the role ARN, trust
+anchor ARN, profile ARN, and region for each attempt are taken from the selected set instead of `--role-arn`,
+`--trust-anchor-arn`, `--profile-arn`, `--region`, and `--endpoint` (which must not be set together with
+`--multi-set`). CreateSession is first attempted with the entry marked `default: true` (or the first entry, if none
+is marked default); on a retryable error (throttling, HTTP 5xx, network/DNS failure) the remaining entries are
+tried in file order. Non-retryable errors such as `AccessDeniedException` fail immediately without trying the
+remaining entries.
+
+* Type: String
+* Required: No
+* Mutually exclusive with `--role-arn`, `--trust-anchor-arn`, `--profile-arn`, `--region`, and `--endpoint`
+
+`--multi-set-file <path>`
+
+Path to the multi-set YAML file. Only valid together with `--multi-set`.
+
+* Type: String
+* Required: No
+* Default: `~/.aws/iamra-multiset.yaml`
+
+The multi-set file format:
+
+```yaml
+- iamra-name: my-failover-set
+  account-id: 123456789012
+  assume_role-arn: arn:aws:iam::123456789012:role/MyRole
+  iamra-set:
+  - trust-anchor-id: 11111111-1111-1111-1111-111111111111
+    profile-id: 22222222-2222-2222-2222-222222222222
+    region: ap-northeast-2
+    default: true
+  - trust-anchor-id: 33333333-3333-3333-3333-333333333333
+    profile-id: 44444444-4444-4444-4444-444444444444
+    region: ap-northeast-1
+```
+
+`assume_role-arn` is the role to obtain temporary credentials for, used for every attempt. The trust anchor and
+profile ARNs for each entry are constructed from `account-id`, `region`, and the corresponding id; the partition
+(`aws`, `aws-cn`, `aws-us-gov`) is taken from `assume_role-arn`. At most one entry may set `default: true`.
+
 ### Example
 
 ```bash
@@ -101,6 +143,15 @@ aws_signing_helper credential-process \
   --private-key client-key.pem \
   --role-arn arn:aws:iam::123456789012:role/MyRole \
   --trust-anchor-arn arn:aws:rolesanywhere:us-east-1:123456789012:trust-anchor/abcdef1234567890
+```
+
+With multi-region failover (the role ARN comes from the multi-set file's `assume_role-arn`):
+
+```bash
+aws_signing_helper credential-process \
+  --certificate client-cert.pem \
+  --private-key client-key.pem \
+  --multi-set my-failover-set
 ```
 
 ## update
