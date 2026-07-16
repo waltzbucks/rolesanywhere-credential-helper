@@ -1,0 +1,75 @@
+stages:
+  - lint
+  - test
+  - build
+  - release
+
+variables:
+  GO_IMAGE: golang:1.26-trixie
+  GOPATH: $CI_PROJECT_DIR/.go
+  GOCACHE: $CI_PROJECT_DIR/.go-build
+  GOFLAGS: -mod=readonly
+
+default:
+  image: $GO_IMAGE
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .go/pkg/mod
+      - .go-build
+  before_script:
+    - go version
+
+lint:
+  stage: lint
+  script:
+    - gofmt -l . | tee /tmp/gofmt.out
+    - test ! -s /tmp/gofmt.out
+    - go vet ./...
+
+# TPM/PKCS#11 signer 테스트는 swtpm/SoftHSM 등 추가 데몬이 필요하므로 제외됨
+# (Makefile의 `test` 타깃이 자체적으로 제외 처리)
+test:
+  stage: test
+  script:
+    - make test
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - tst/certs
+
+build:
+  stage: build
+  script:
+    - make release
+    - ./build/bin/aws_signing_helper version
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - build/bin/aws_signing_helper
+
+# 태그 push 시 정적 크로스 빌드 산출물 생성 (CGO 불필요한 pure-Go 빌드)
+release:
+  stage: release
+  rules:
+    - if: $CI_COMMIT_TAG
+  parallel:
+    matrix:
+      - GOOS: linux
+        GOARCH: [amd64, arm64]
+  variables:
+    CGO_ENABLED: "0"
+  script:
+    - VERSION=$(sed -n 's/^VERSION=//p' Makefile)
+    - |
+      go build \
+        -ldflags "-X 'github.com/aws/rolesanywhere-credential-helper/cmd.Version=${VERSION}' -w -s" \
+        -trimpath \
+        -o build/bin/aws_signing_helper-${GOOS}-${GOARCH} \
+        main.go
+  artifacts:
+    paths:
+      - build/bin/
